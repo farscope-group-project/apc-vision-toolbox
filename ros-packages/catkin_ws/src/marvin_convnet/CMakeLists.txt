@@ -14,7 +14,16 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
 )
 
-find_package(OpenCV REQUIRED)
+find_package(Qt5 REQUIRED COMPONENTS
+  Core
+  Gui
+  Widgets
+  Test
+  Concurrent
+  OpenGL
+)
+
+find_package(OpenCV 2 REQUIRED)
 
 # CUDA and CUDNN
 find_package(CUDA REQUIRED)

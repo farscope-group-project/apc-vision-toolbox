@@ -56,6 +56,11 @@
     #define ComputeT_MIN DBL_MIN
 #endif
 
+
+#if CUDA_VERSION >= 8000
+#define CUBLAS_DATA_HALF CUDA_R_16F
+#endif
+
 //////////////////////////////////////////////////////////////////////////////////////////////////
 // Includes
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -78,10 +83,18 @@
 #include <thread>
 #include <chrono>
 #include <future>
+#include <cuda.h>
 #include <cublas_v2.h>
 #include <curand.h>
 #include <cudnn.h>
 #include <sys/time.h>
+
+#define USE_OPENCV 0
+
+#if USE_OPENCV
+#include "opencv2/highgui/highgui.hpp"
+#include "opencv2/imgproc/imgproc.hpp"
+#endif
 
 namespace marvin {
 
@@ -97,7 +110,7 @@ enum LRPolicy { LR_fixed, LR_step, LR_exp, LR_inv, LR_multistep, LR_poly, LR_sig
 enum SolverAlgorithm { SGD, AdaDelta, AdaGrad, Adam, NAG, RMSprop};
 enum Regularizer { L2, L1 };
 enum LRN { CrossChannel, DivisiveNormalization };
-enum ElementWiseOp { ElementWise_EQL, ElementWise_MUL, ElementWise_SUM, ElementWise_MAX };
+enum ElementWiseOp { ElementWise_EQL, ElementWise_MUL, ElementWise_SUM, ElementWise_MIN, ElementWise_MAX };
 
 
 ComputeT anyval;
@@ -472,6 +485,7 @@ public:
         else if (0 == this->member[name]->returnString().compare("ElementWise_EQL"))        variable = ElementWise_EQL;
         else if (0 == this->member[name]->returnString().compare("ElementWise_MUL"))        variable = ElementWise_MUL;
         else if (0 == this->member[name]->returnString().compare("ElementWise_SUM"))        variable = ElementWise_SUM;
+        else if (0 == this->member[name]->returnString().compare("ElementWise_MIN"))        variable = ElementWise_MIN;
         else if (0 == this->member[name]->returnString().compare("ElementWise_MAX"))        variable = ElementWise_MAX;
         else{ std::cout<<"Unsupported "<<name<<" = "<<this->member[name]->returnString()<<std::endl; FatalError(__LINE__); }
     };
@@ -976,36 +990,6 @@ size_t checkNaN(StorageT* dataGPU, size_t n){
     if (countNaN>0){
         std::cout<<"        checkNaN result: "<<countNaN<<" out of "<<n<<" ("<< 100*ComputeT(countNaN)/n<< "\045) values are NaN, "<<n-countNaN<<" are not NaN."; //<<std::endl;
     }
-
-    /*
-
-    std::cout<<std::endl;
-    for (size_t i=0;i<10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-    std::cout<<std::endl;
-
-    
-
-    std::cout<<std::endl;
-    for (size_t i=0;i<10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-    for (size_t i=640+0;i<640+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-    for (size_t i=640*2+0;i<640*2+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-
-    std::cout<< std::endl;
-
-    for (size_t i=480*640+0;i<480*640+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-    for (size_t i=480*640+640+0;i<480*640+640+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-    for (size_t i=480*640+640*2+0;i<480*640+640*2+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-
-    std::cout<< std::endl;
-
-    for (size_t i=480*640*2+0;i<480*640*2+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-    for (size_t i=480*640*2+640+0;i<480*640*2+640+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-    for (size_t i=480*640*2+640*2+0;i<480*640*2+640*2+10;++i) std::cout<< CPUStorage2ComputeT(CPUmem[i])<<" ";  std::cout<< std::endl;
-
-    std::cout<< std::endl;
-
-    */
-
     delete [] CPUmem;
     return countNaN;
 }
@@ -1334,6 +1318,21 @@ __global__ void LossGrad_Contrastive(
 }
 
 
+__global__ void Kernel_OpenCV_BGR_image_to_Marvin(size_t CUDA_NUM_LOOPS, size_t N, size_t channels, size_t height, size_t width, const uint8_t* pIn, uint8_t* pOut) {
+    const size_t idxBase = size_t(CUDA_NUM_LOOPS) * (size_t(CUDA_NUM_THREADS) * size_t(blockIdx.x) + size_t(threadIdx.x)); if (idxBase >= N) return;
+    for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
+        size_t chn = 2 - (idx % 3);
+        size_t col = (idx/3)%width;
+        size_t row = (idx/(3*width));
+        pOut[(chn*height+row)*width+col] = pIn[idx];
+    }
+}
+
+void OpenCV_BGR_image_to_Marvin(size_t channels, size_t height, size_t width, const uint8_t* pIn, uint8_t* pOut){
+    size_t N = channels * height * width;
+    Kernel_OpenCV_BGR_image_to_Marvin<<<CUDA_GET_BLOCKS(N), CUDA_NUM_THREADS >>>(CUDA_GET_LOOPS(N), N, channels, height, width, pIn, pOut);
+}
+
 __global__ void Kernel_convert_to_StorageT_subtract(size_t CUDA_NUM_LOOPS, size_t N, size_t sizeofitem, const half* pIn, const StorageT* pMean, StorageT* pOut) {
     const size_t idxBase = size_t(CUDA_NUM_LOOPS) * (size_t(CUDA_NUM_THREADS) * size_t(blockIdx.x) + size_t(threadIdx.x)); if (idxBase >= N) return;
     if (pMean==NULL) for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ) pOut[idx] = GPUCompute2StorageT( ComputeT(__half2float(pIn[idx])) );
@@ -1432,22 +1431,6 @@ void GPU_set_ones(size_t N, StorageT* GPUdst){
 
 void GPU_set_zeros(size_t N, StorageT* GPUdst){
     GPU_set_value(N, GPUdst, CPUCompute2StorageT(0));
-}
-
-__global__ void Kernel_dropout_forward(size_t CUDA_NUM_LOOPS, size_t N, StorageT* GPUdst, const unsigned int* GPUmask, const StorageT* GPUsrc, unsigned int threshold, ComputeT scale){
-    const size_t idxBase = size_t(CUDA_NUM_LOOPS) * (size_t(CUDA_NUM_THREADS) * size_t(blockIdx.x) + size_t(threadIdx.x));
-    if (idxBase >= N) return;
-    for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
-        GPUdst[idx] = GPUCompute2StorageT( (GPUmask[idx]>threshold) * scale * GPUStorage2ComputeT(GPUsrc[idx]));
-    }
-}
-
-__global__ void Kernel_dropout_backward(size_t CUDA_NUM_LOOPS, size_t N, StorageT* GPUdst, const unsigned int* GPUmask, const StorageT* GPUsrc, unsigned int threshold, ComputeT scale){
-    const size_t idxBase = size_t(CUDA_NUM_LOOPS) * (size_t(CUDA_NUM_THREADS) * size_t(blockIdx.x) + size_t(threadIdx.x));
-    if (idxBase >= N) return;
-    for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
-        GPUdst[idx] = GPUCompute2StorageT( ((GPUmask[idx]>threshold) * scale * GPUStorage2ComputeT(GPUsrc[idx])) + GPUStorage2ComputeT(GPUdst[idx]) );
-    }
 }
 
 __global__ void Kernel_elementwise_multiplication(size_t CUDA_NUM_LOOPS, size_t N, StorageT* GPUdst, const StorageT* GPUsrcA, const StorageT* GPUsrcB){
@@ -1972,7 +1955,6 @@ __global__ void Kernel_update_AdaDeltaL1(size_t CUDA_NUM_LOOPS, size_t N, int nN
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         size_t h2_idx = N*(nNets+2)+idx;
@@ -1998,7 +1980,6 @@ __global__ void Kernel_update_AdaDeltaL2(size_t CUDA_NUM_LOOPS, size_t N, int nN
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         size_t h2_idx = N*(nNets+2)+idx;
@@ -2056,7 +2037,6 @@ __global__ void Kernel_update_AdamL1(size_t CUDA_NUM_LOOPS, size_t N, int nNets,
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         size_t h2_idx = N*(nNets+2)+idx;
@@ -2079,7 +2059,6 @@ __global__ void Kernel_update_AdamL2(size_t CUDA_NUM_LOOPS, size_t N, int nNets,
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         size_t h2_idx = N*(nNets+2)+idx;
@@ -2099,7 +2078,6 @@ __global__ void Kernel_update_NAGL1(size_t CUDA_NUM_LOOPS, size_t N, int nNets, 
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         ComputeT g;
@@ -2119,7 +2097,6 @@ __global__ void Kernel_update_NAGL2(size_t CUDA_NUM_LOOPS, size_t N, int nNets, 
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         ComputeT g  = decay * w;     // L2 regularization
@@ -2136,7 +2113,6 @@ __global__ void Kernel_update_RMSpropL1(size_t CUDA_NUM_LOOPS, size_t N, int nNe
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         ComputeT g;
@@ -2155,7 +2131,6 @@ __global__ void Kernel_update_RMSpropL2(size_t CUDA_NUM_LOOPS, size_t N, int nNe
     if (idxBase >= N) return;
     for (size_t idx = idxBase; idx < min(N,idxBase+CUDA_NUM_LOOPS); ++idx ){
         ComputeT w  = GPUStorage2ComputeT(weights[idx]);
-        //ComputeT u  = GPUStorage2ComputeT(gradients[idx]);
         size_t h_idx = N*(nNets+1)+idx;
         ComputeT h  = GPUStorage2ComputeT(gradients[h_idx]);
         ComputeT g  = decay * w;     // L2 regularization
@@ -2268,14 +2243,12 @@ cublasStatus_t Hasum(cublasHandle_t handle, int n, const half *x, int incx, floa
     return CUBLAS_STATUS_SUCCESS;
 }
 
-#if CUDA_VERSION >= 8000
-    #define CUDA_DATA_HALF CUDA_R_16F
-#else
-    #define CUDA_DATA_HALF CUBLAS_DATA_HALF
-#endif
-
 cublasStatus_t Hgemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, const float *alpha, const half *A, int lda, const half *B, int ldb, const float *beta,  half *C, int ldc){
-    return cublasSgemmEx(handle, transa, transb, m, n, k, alpha, A, CUDA_DATA_HALF, lda, B, CUDA_DATA_HALF, ldb, beta, C, CUDA_DATA_HALF, ldc);
+#if CUDA_VERSION >= 8000
+    return cublasSgemmEx(handle, transa, transb, m, n, k, alpha, A, CUDA_R_16F, lda, B, CUDA_R_16F, ldb, beta, C, CUDA_R_16F, ldc);
+#else
+    return cublasSgemmEx(handle, transa, transb, m, n, k, alpha, A, CUBLAS_DATA_HALF, lda, B, CUBLAS_DATA_HALF, ldb, beta, C, CUBLAS_DATA_HALF, ldc);
+#endif
 }
 
 
@@ -3273,6 +3246,43 @@ public:
 };
 
 
+class ConstantLayer: public DataLayer {
+    std::vector<ComputeT> data;
+public:
+    ConstantLayer(std::string name_): DataLayer(name_){
+        train_me = false;
+    };
+    ConstantLayer(JSON* json){
+        SetOrDie(json, name)
+        SetValue(json, phase,       TrainingTesting)
+        SetOrDie(json, data)
+        train_me = false;
+    };
+    ~ConstantLayer(){ };
+    int numofitems(){ return 1; };
+    void shuffle(){};
+    void forward(Phase phase_){ ++epoch; };
+    size_t Malloc(Phase phase_){
+        std::cout<< (train_me? "* " : "  ");
+        std::cout<<name<<std::endl;
+        if (!in.empty()){   std::cout<<"ConstantLayer shouldn't have any in's"<<std::endl; FatalError(__LINE__); }
+        if (out.size()!=1){   std::cout<<"ConstantLayer should have one out"<<std::endl; FatalError(__LINE__); }
+        size_t memoryBytes = 0;
+        std::vector<int> dim;
+        dim.push_back(data.size());
+        dim.push_back(1);
+        dim.push_back(1);
+        out[0]->need_diff = false;
+        memoryBytes += out[0]->Malloc(dim);
+        StorageT* dataStorageT = new StorageT[data.size()];
+        for (size_t i=0; i<data.size(); ++i) dataStorageT[i] = CPUCompute2StorageT(data[i]); 
+        checkCUDA(__LINE__, cudaMemcpy(out[0]->dataGPU, dataStorageT, data.size() * sizeofStorageT, cudaMemcpyHostToDevice) );
+        delete [] dataStorageT;
+        return memoryBytes;
+    };
+};
+
+
 class TensorLayer: public DataLayer {
     StorageT* tensorGPU;
 public:
@@ -3559,9 +3569,194 @@ class MemoryDataLayer : public DataLayer {
 };
 
 
+#if USE_OPENCV
+class ImageDataLayer : public DataLayer {
+    StorageT* dataCPU;
+    StorageT* dataGPU;
+    StorageT* labelCPU;
+    StorageT* labelGPU;
+
+    std::vector<size_t> ordering;
+    std::vector<std::string> img_fname;
+    std::vector<StorageT> img_label;
+
+    std::future<void> lock;
+    int epoch_prefetch;
+
+public:    
+    std::vector<int> size_output;
+    std::string file_list;
+    int batch_size;
+    ComputeT mean_value;
+
+    ImageDataLayer(JSON* json){
+        SetOrDie(json, name)
+        SetValue(json, phase,       Training)
+        SetOrDie(json, size_output)
+        SetOrDie(json, file_list)
+        SetOrDie(json, mean_value)
+        SetValue(json, batch_size,  64)
+        SetValue(json, random,      true)
+        init();
+    };
+
+    void shuffle(){
+        if (!random) return;
+        if (phase!=Testing){
+            ordering = randperm(img_label.size(), rng);
+        }
+    };     
+
+    int numofitems(){
+        return img_label.size();
+    };
+    void init(){
+        train_me = false;
+        std::cout<<"ImageDataLayer "<<name<<" loading data: ";
+
+        std::ifstream fin(file_list);
+        while (!fin.eof()){
+            ComputeT label;
+            std::string fname;
+            fin>>label;
+            if (fin.eof()) break;
+            fin>>fname;
+            img_label.push_back(CPUCompute2StorageT(label));
+            img_fname.push_back(fname);
+        };
+        fin.close();
+
+        std::cout<<"# of images = "<<img_label.size()<<std::endl;
+
+        if (phase!=Testing){
+            shuffle();
+        }else{
+            ordering.resize(numofitems());
+            for (int i=0;i<numofitems();++i) ordering[i]=i;
+        }
+    }
+
+    ImageDataLayer(std::string name_, Phase phase_, int batch_size_): DataLayer(name_), batch_size(batch_size_){
+        phase = phase_;
+
+        dataCPU  =NULL;
+        labelCPU =NULL;
+        dataGPU  =NULL;
+        labelGPU =NULL;
+
+        init();
+    };
+
+    ~ImageDataLayer(){
+        if (dataCPU!=NULL)  delete [] dataCPU;
+        if (labelCPU!=NULL) delete [] labelCPU;
+        if (dataGPU!=NULL)  checkCUDA(__LINE__, cudaFree(dataGPU));
+        if (labelGPU!=NULL) checkCUDA(__LINE__, cudaFree(labelGPU));
+    };
+
+    void prefetch(){
+
+        size_t perImageSize = 3*size_output[0]*size_output[1];
+        cv::Size resize_size(size_output[0],size_output[1]);
+
+        for (size_t i=0;i<batch_size;++i){
+            // choose image
+            int image_i = ordering[counter];
+
+            // read image
+            cv::Mat image_RGB = cv::imread(img_fname[image_i],CV_LOAD_IMAGE_UNCHANGED);
+            cv::Mat image_RGB_resize;
+
+            // resize image
+            cv::resize(image_RGB,image_RGB_resize,resize_size);
+
+            // convert image and subtract mean
+            StorageT* pImage = dataCPU+i*perImageSize;
+            StorageT* pImageEnd   = pImage+perImageSize;
+            uchar* pPixel = image_RGB_resize.data;
+            while(pImage!=pImageEnd){
+                *pImage = CPUCompute2StorageT(ComputeT(*pPixel)- mean_value);
+                ++pImage; ++pPixel;
+            }
+
+            // copy label
+            labelCPU[i] = img_label[image_i];
+            
+            counter++;
+            if (counter>= ordering.size()){
+                if (phase!=Testing) shuffle();
+                counter = 0;
+                ++epoch_prefetch;
+            }
+        }
+
+        // copy from CPU to GPU
+        checkCUDA(__LINE__, cudaMemcpy(dataGPU, dataCPU, batch_size*perImageSize*sizeofStorageT, cudaMemcpyHostToDevice) );
+        checkCUDA(__LINE__, cudaMemcpy(labelGPU, labelCPU, batch_size*sizeofStorageT, cudaMemcpyHostToDevice) );
+    };
+
+
+    size_t Malloc(Phase phase_){
+        if (phase == Training && phase_==Testing) return 0;
+        
+        if (!in.empty()){   std::cout<<"ImageDataLayer shouldn't have any in's"<<std::endl; FatalError(__LINE__); }
+        if (out.empty()){   std::cout<<"ImageDataLayer should have some out's"<<std::endl; FatalError(__LINE__); }
+        if (out.size()!=2){  std::cout<<"ImageDataLayer: # of out's should be 2"<<std::endl; FatalError(__LINE__); }
+
+        size_t memoryBytes = 0;
+        std::cout<< (train_me? "* " : "  ");
+        std::cout<<name<<std::endl;
+
+        dataCPU  = new StorageT[batch_size*3*size_output[0]*size_output[1]];
+        labelCPU = new StorageT[batch_size];
+        checkCUDA(__LINE__, cudaMalloc(&dataGPU, batch_size*3*size_output[0]*size_output[1]*sizeofStorageT) );
+        checkCUDA(__LINE__, cudaMalloc(&labelGPU, batch_size*sizeofStorageT) );
+
+        out[0]->need_diff = false;
+        std::vector<int> data_dim;
+        data_dim.push_back(batch_size);
+        data_dim.push_back(3);
+        data_dim.push_back(size_output[0]);
+        data_dim.push_back(size_output[1]);
+        out[0]->receptive_field.resize(data_dim.size()-2);  fill_n(out[0]->receptive_field.begin(), data_dim.size()-2,1);
+        out[0]->receptive_gap.resize(data_dim.size()-2);    fill_n(out[0]->receptive_gap.begin(),   data_dim.size()-2,1);
+        out[0]->receptive_offset.resize(data_dim.size()-2); fill_n(out[0]->receptive_offset.begin(),data_dim.size()-2,0);
+        memoryBytes += out[0]->Malloc(data_dim);
+
+        out[1]->need_diff = false;
+        std::vector<int> label_dim;
+        label_dim.push_back(batch_size);
+        label_dim.push_back(1);
+        label_dim.push_back(1);
+        label_dim.push_back(1);
+        out[1]->receptive_field.resize(label_dim.size()-2);  fill_n(out[1]->receptive_field.begin(), label_dim.size()-2,1);
+        out[1]->receptive_gap.resize(label_dim.size()-2);    fill_n(out[1]->receptive_gap.begin(),   label_dim.size()-2,1);
+        out[1]->receptive_offset.resize(label_dim.size()-2); fill_n(out[1]->receptive_offset.begin(),label_dim.size()-2,0);
+        memoryBytes += out[1]->Malloc(label_dim);
+
+        lock = std::async(std::launch::async,&ImageDataLayer::prefetch,this);
+
+        return memoryBytes;
+    };
+
+
+    void forward(Phase phase_){
+        lock.wait();
+        epoch = epoch_prefetch;
+
+        std::swap(out[0]->dataGPU,dataGPU);
+        std::swap(out[1]->dataGPU,labelGPU);
+        lock = std::async(std::launch::async,&ImageDataLayer::prefetch,this);
+    };
+};
+#endif
+
+
 class PlaceHolderDataLayer : public DataLayer {
     public:
     std::vector<int> dim;
+    std::string file_mean;
+    StorageT* meanGPU;
 
     int numofitems(){
         return 1;
@@ -3579,6 +3774,7 @@ class PlaceHolderDataLayer : public DataLayer {
         SetOrDie(json, name)
         SetValue(json, phase,       Testing)
         SetOrDie(json, dim)
+        SetValue(json, file_mean,   "")
         init();
     };
     ~PlaceHolderDataLayer(){
@@ -3599,12 +3795,23 @@ class PlaceHolderDataLayer : public DataLayer {
         out[0]->receptive_offset.resize(dim.size()-2); fill_n(out[0]->receptive_offset.begin(),dim.size()-2,0);
         memoryBytes += out[0]->Malloc(dim);
 
+        // mean
+        if(file_mean.empty()){
+            meanGPU = NULL;
+        }else{
+            Tensor<StorageT>* meanCPU = new Tensor<StorageT>(file_mean);
+            meanCPU->print(veci(0));
+            checkCUDA(__LINE__, cudaMalloc(&meanGPU, meanCPU->numBytes()) );
+            memoryBytes += meanCPU->numBytes();
+            meanCPU->writeGPU(meanGPU);
+            delete meanCPU;
+        }
+
         return memoryBytes;
     }
     void shuffle(){};
     void forward(Phase phase_){};
 };
-
 
 template <class T>
 class DiskDataLayer : public DataLayer {
@@ -5351,10 +5558,6 @@ public:
         for (int i=0;i<out.size();++i){
             out[i]->need_diff = in[i*2]->need_diff;
 
-            if (! (in[i*2+1]->dim[0] == in[i*2]->dim[0] && sizeofitem(in[i*2+1]->dim) == shape.size())){
-                std::cout<<std::endl<<"ROILayer in["<<i*2+1<<"]->dim is wrong"<<std::endl; FatalError(__LINE__);
-            }
-
             std::vector<int> dim;
             dim.push_back(in[i*2]->dim[0]);
 
@@ -5587,6 +5790,8 @@ public:
                     }
                 }
             break;
+            case ElementWise_MIN: std::cout<<"Not implemented yet"<<std::endl; FatalError(__LINE__);
+            break;
             case ElementWise_MAX: std::cout<<"Not implemented yet"<<std::endl; FatalError(__LINE__);
             break;
         };
@@ -5609,6 +5814,8 @@ public:
                         CoeffElementWiseSumAccumulate<<<CUDA_GET_BLOCKS(N),CUDA_NUM_THREADS>>>(CUDA_GET_LOOPS(N), N, coeff[ii], coeff_data, ii * items, dim, out[j]->diffGPU, in[i]->diffGPU);
                     }
                 }
+            break;
+            case ElementWise_MIN: std::cout<<"Not implemented yet"<<std::endl; FatalError(__LINE__);
             break;
             case ElementWise_MAX: std::cout<<"Not implemented yet"<<std::endl; FatalError(__LINE__);
             break;
@@ -6819,7 +7026,7 @@ public:
                     bnScaleBiasMeanVarDesc,
                     weight_dataGPU,
                     bias_dataGPU,
-                    1 / (1 + numForwardTrainingPasses),
+                    1. / (1 + numForwardTrainingPasses),
                     resultRunningMean + weight_index,
                     resultRunningInvVariance + bias_index,
                     epsilon,
@@ -6990,6 +7197,9 @@ public:
                 else if (fpTypeid==typeID(typeid(char)))        pLayer = new DiskDataLayer<char>(p);
                 else if (fpTypeid==typeID(typeid(bool)))        pLayer = new DiskDataLayer<bool>(p);
             }
+#if USE_OPENCV
+            else if (0==type.compare("ImageData"))              pLayer = new ImageDataLayer(p);
+#endif            
             else if (0==type.compare("ElementWise"))            pLayer = new ElementWiseLayer(p);
             else if (0==type.compare("Concat"))                 pLayer = new ConcatLayer(p);
             else if (0==type.compare("Convolution"))            pLayer = new ConvolutionLayer(p);
@@ -7004,6 +7214,7 @@ public:
             else if (0==type.compare("ROI"))                    pLayer = new ROILayer(p);
             else if (0==type.compare("ROIPooling"))             pLayer = new ROIPoolingLayer(p);
             else if (0==type.compare("Tensor"))                 pLayer = new TensorLayer(p);
+            else if (0==type.compare("Constant"))               pLayer = new ConstantLayer(p);
             else if (0==type.compare("PlaceHolderData"))        pLayer = new PlaceHolderDataLayer(p);
             else if (0==type.compare("LSTM"))                   pLayer = new LSTMLayer(p);
             else if (0==type.compare("SequenceGeneration"))    {pLayer = new SequenceGenerationLayer(p); sequence_layers.push_back((SequenceGenerationLayer*)pLayer);   }
@@ -7184,7 +7395,7 @@ public:
 
                 layers[l]->forward(phase);
 
-                if (debug_mode){ // || l==38){
+                if (debug_mode){
                     checkCUDA(__LINE__,cudaDeviceSynchronize()); checkCUDA(__LINE__,cudaGetLastError());
                     if (layers[l]->out.size()>0){
                         for (size_t o=0; o<layers[l]->out.size();++o){
@@ -8066,3 +8277,4 @@ public:
 };
 
 }  // namespace marvin
+
